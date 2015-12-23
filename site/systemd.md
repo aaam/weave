@@ -1,7 +1,9 @@
 ---
-title: Using Weave with systemd
+title: Using Weave with Systemd
 layout: default
 ---
+
+# Using Weave with Systemd
 
 Having installed `weave` as per [readme][], you might wish to configure the
 init daemon to start it on boot. Most recent Linux distribution releases are
@@ -15,14 +17,13 @@ normally place it in `/etc/systemd/system/weave.service`.
 
     [Unit]
     Description=Weave Network
-    Documentation=http://zettio.github.io/weave/
+    Documentation=http://docs.weave.works/weave/latest_release/
     Requires=docker.service
     After=docker.service
     [Service]
     EnvironmentFile=-/etc/sysconfig/weave
     ExecStartPre=/usr/local/bin/weave launch $PEERS
-    ExecStart=/usr/bin/docker logs -f weave
-    SuccessExitStatus=2
+    ExecStart=/usr/bin/docker attach weave
     ExecStop=/usr/local/bin/weave stop
     [Install]
     WantedBy=multi-user.target
@@ -36,9 +37,11 @@ the following format:
 
 You can also use the [connect][] command to add participating hosts dynamically.
 
-Additionally, if you want to enable [encryption][] you can specify a password with
-`WEAVE_PASSWORD="MakeSureThisIsSecure"` in the `/etc/sysconfig/weave` environment
-file, and it will get picked up by weave on launch.
+Additionally, if you want to enable [encryption][] you can specify a
+password with e.g. `WEAVE_PASSWORD="wfvAwt7sj"` in the
+`/etc/sysconfig/weave` environment file, and it will get picked up by
+weave on launch. Recommendations for choosing a suitably strong
+password can be found [here](features.html#security).
 
 You now should be able to launch weave with
 
@@ -64,7 +67,7 @@ context with the commands shown below. You will need to have the
     sudo semanage fcontext -a -t unconfined_exec_t -f f /usr/local/bin/weave
     sudo restorecon /usr/local/bin/weave
 
-[readme]: https://github.com/zettio/weave/blob/master/README.md#installation
-[connect]: http://zettio.github.io/weave/features.html#dynamic-topologies
+[readme]: https://github.com/weaveworks/weave/blob/master/README.md#installation
+[connect]: features.html#dynamic-topologies
 [systemd]: http://www.freedesktop.org/wiki/Software/systemd/
-[encryption]: http://zettio.github.io/weave/how-it-works.html#crypto
+[encryption]: features.html#security

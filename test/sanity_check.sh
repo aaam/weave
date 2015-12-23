@@ -5,9 +5,22 @@
 set -e
 
 whitely echo Ping each host from the other
-run_on $HOST2 ping -q -c 4 $HOST1
-run_on $HOST1 ping -q -c 4 $HOST2
+for host in $HOSTS; do
+    for other in $HOSTS; do
+        [ $host = $other ] || run_on $host $PING $other
+    done
+done
 
 whitely echo Check we can reach docker
-docker_on $HOST1 info
-docker_on $HOST2 info
+
+for host in $HOSTS; do
+    echo
+    echo Host Version Info: $host
+    echo =====================================
+    echo "# docker version"
+    docker_on $host version
+    echo "# docker info"
+    docker_on $host info
+    echo "# weave version"
+    weave_on $host version
+done

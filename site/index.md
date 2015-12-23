@@ -3,14 +3,12 @@ title: weave, the Docker network
 layout: default
 ---
 
-# weave documentation
+# Weave Documentation
 
- * [Introduction and example (in README)](https://github.com/zettio/weave#readme)
+ * [Introduction, Installation and Example](https://github.com/weaveworks/weave#readme)
+ * [Getting Started Guides](http://weave.works/guides/)
  * [Features](features.html)
  * [Troubleshooting](troubleshooting.html)
  * [Building](building.html)
  * [How it works](how-it-works.html)
- * [Contact information](https://github.com/zettio/weave#contact-us)
- * *Installation Notes*
-   * [Using with boot2docker](boot2docker.html)
-   * [Using with systemd](systemd.html)
+ * [Latest release](https://github.com/weaveworks/weave/releases/tag/latest_release)

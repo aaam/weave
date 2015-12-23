@@ -4,22 +4,29 @@
 
 C1=10.2.56.34
 C2=10.2.54.91
+DOMAIN=foo.bar
+NAME=seetwo.$DOMAIN
 
 start_suite "Resolve names in custom domain"
 
-weave_on $HOST1 stop || true
-weave_on $HOST1 stop-dns || true
-weave_on $HOST1 launch-dns 10.2.254.1/24 --localDomain foo.bar.
+# Check with a trailing dot on domain
+weave_on $HOST1 launch --dns-domain $DOMAIN.
 
-docker_on $HOST1 rm -f c1 c2 || true
+start_container          $HOST1 $C2/24 --name=c2 -h $NAME
+start_container_with_dns $HOST1 $C1/24 --name=c1
 
-weave_on $HOST1 run $C2/24 -t --name=c2 -h seetwo.foo.bar ubuntu
-weave_on $HOST1 run --with-dns $C1/24 -t --name=c1 aanand/docker-dnsutils /bin/sh
+assert_dns_record $HOST1 c1 $NAME $C2
 
-ok=$(docker -H tcp://$HOST1:2375 exec -i c1 sh -c "dig +short seetwo.foo.bar.")
-assert "echo $ok" "$C2"
+rm_containers $HOST1 c1
+rm_containers $HOST1 c2
+weave_on $HOST1 stop
 
-ok=$(docker -H tcp://$HOST1:2375 exec -i c1 sh -c "dig +short -x $C2")
-assert "echo $ok" "seetwo.foo.bar."
+# Check without a trailing dot on domain
+weave_on $HOST1 launch --dns-domain $DOMAIN
+
+start_container          $HOST1 $C2/24 --name=c2 -h $NAME
+start_container_with_dns $HOST1 $C1/24 --name=c1
+
+assert_dns_record $HOST1 c1 $NAME $C2
 
 end_suite

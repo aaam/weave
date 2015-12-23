@@ -2,8 +2,17 @@
 
 set -e
 
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Protect against being sourced multiple times to prevent
+# overwriting assert.sh global state
+if ! [ -z "$SOURCED_CONFIG_SH" ]; then
+    return
+fi
+SOURCED_CONFIG_SH=true
+
 # these ought to match what is in Vagrantfile
-N_MACHINES=${N_MACHINES:-2}
+N_MACHINES=${N_MACHINES:-3}
 IP_PREFIX=${IP_PREFIX:-192.168.48}
 IP_SUFFIX_BASE=${IP_SUFFIX_BASE:-10}
 
@@ -17,53 +26,230 @@ fi
 # these are used by the tests
 HOST1=$(echo $HOSTS | cut -f 1 -d ' ')
 HOST2=$(echo $HOSTS | cut -f 2 -d ' ')
+HOST3=$(echo $HOSTS | cut -f 3 -d ' ')
 
-. ./assert.sh
+. "$DIR/assert.sh"
 
-SSH=${SSH:-ssh -l vagrant -i ./insecure_private_key -o UserKnownHostsFile=./.ssh_known_hosts -o CheckHostIP=no -o StrictHostKeyChecking=no}
+
+SSH_DIR=${SSH_DIR:-$DIR}
+SSH=${SSH:-ssh -l vagrant -i "$SSH_DIR/insecure_private_key" -o "UserKnownHostsFile=$SSH_DIR/.ssh_known_hosts" -o CheckHostIP=no -o StrictHostKeyChecking=no}
+
+SMALL_IMAGE="alpine"
+DNS_IMAGE="aanand/docker-dnsutils"
+TEST_IMAGES="$SMALL_IMAGE $DNS_IMAGE"
+
+PING="ping -nq -W 1 -c 1"
+CHECK_ETHWE_UP="grep ^1$ /sys/class/net/ethwe/carrier"
+CHECK_ETHWE_MISSING="test ! -d /sys/class/net/ethwe"
+
+DOCKER_PORT=2375
+
+upload_executable() {
+    host=$1
+    file=$2
+    target=${3:-/usr/local/bin/$(basename "$file")}
+    dir=$(dirname "$target")
+    run_on $host "[ -e '$dir' ] || sudo mkdir -p '$dir'"
+    [ -z "$DEBUG" ] || greyly echo "Uploading to $host: $file -> $target" >&2
+    <"$file" remote $host $SSH $host sh -c "cat | sudo tee $target >/dev/null"
+    run_on $host "sudo chmod a+x $target"
+}
 
 remote() {
     rem=$1
     shift 1
-    $@ > >(while read line; do echo -e "\e[0;34m$rem>\e[0m $line"; done)
+    "$@" > >(while read line; do echo -e $'\e[0;34m'"$rem>"$'\e[0m'" $line"; done)
+}
+
+colourise() {
+    [ -t 0 ] && echo -ne $'\e['$1'm' || true
+    shift
+    # It's important that we don't do this in a subshell, as some
+    # commands we execute need to modify global state
+    "$@"
+    [ -t 0 ] && echo -ne $'\e[0m' || true
 }
 
 whitely() {
-    echo -e '\e[1;37m'`$@`'\e[0m'
+    colourise '1;37' "$@"
 }
 
 greyly () {
-    echo -e '\e[0;37m'`$@`'\e[0m'
+    colourise '0;37' "$@"
+}
+
+redly() {
+    colourise '1;31' "$@"
+}
+
+greenly() {
+    colourise '1;32' "$@"
 }
 
 run_on() {
     host=$1
     shift 1
-    greyly echo "Running on $host: $@"
-    remote $host $SSH $host $@
+    [ -z "$DEBUG" ] || greyly echo "Running on $host: $@" >&2
+    remote $host $SSH $host "$@"
 }
 
 docker_on() {
     host=$1
     shift 1
-    greyly echo "Docker on $host: $@"
-    docker -H tcp://$host:2375 $@
+    [ -z "$DEBUG" ] || greyly echo "Docker on $host:$DOCKER_PORT: $@" >&2
+    docker -H tcp://$host:$DOCKER_PORT "$@"
+}
+
+docker_api_on() {
+    host=$1
+    method=$2
+    url=$3
+    data=$4
+    shift 4
+    [ -z "$DEBUG" ] || greyly echo "Docker (API) on $host:$DOCKER_PORT: $method $url" >&2
+    echo -n "$data" | curl -s -f -X "$method" -H Content-Type:application/json "http://$host:$DOCKER_PORT/v1.15$url" -d @-
+}
+
+proxy() {
+    DOCKER_PORT=12375 "$@"
 }
 
 weave_on() {
     host=$1
     shift 1
-    greyly echo "Weave on $host: $@"
-    DOCKER_HOST=tcp://$host:2375 $WEAVE $@
+    [ -z "$DEBUG" ] || greyly echo "Weave on $host:$DOCKER_PORT: $@" >&2
+    DOCKER_HOST=tcp://$host:$DOCKER_PORT $WEAVE "$@"
+}
+
+stop_router_on() {
+    host=$1
+    shift 1
+    # we don't invoke `weave stop-router` here because that removes
+    # the weave container, which means we a) can't grab coverage
+    # stats, and b) can't inspect the logs when tests fail.
+    docker_on $host stop weave 1>/dev/null 2>&1 || true
+    docker_on $host stop weaveproxy 1>/dev/null 2>&1 || true
+    if [ -n "$COVERAGE" ] ; then
+        collect_coverage $host weave
+        collect_coverage $host weaveproxy
+    fi
+}
+
+exec_on() {
+    host=$1
+    container=$2
+    shift 2
+    docker -H tcp://$host:$DOCKER_PORT exec $container "$@"
+}
+
+start_container() {
+    host=$1
+    shift 1
+    weave_on $host run "$@" -t $SMALL_IMAGE /bin/sh
+}
+
+start_container_with_dns() {
+    host=$1
+    shift 1
+    weave_on $host run "$@" -t $DNS_IMAGE /bin/sh
+}
+
+start_container_local_plugin() {
+    host=$1
+    shift 1
+    # using ssh rather than docker -H because CircleCI docker client is older
+    $SSH $host docker run "$@" -dt --net=weave $SMALL_IMAGE /bin/sh
+}
+
+proxy_start_container() {
+    host=$1
+    shift 1
+    proxy docker_on $host run "$@" -dt $SMALL_IMAGE /bin/sh
+}
+
+proxy_start_container_with_dns() {
+    host=$1
+    shift 1
+    proxy docker_on $host run "$@" -dt $DNS_IMAGE /bin/sh
+}
+
+rm_containers() {
+    host=$1
+    shift
+    [ $# -eq 0 ] || docker_on $host rm -f "$@" >/dev/null
+}
+
+container_ip() {
+    weave_on $1 ps $2 | grep -o -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
+}
+
+# assert_dns_record <host> <container> <name> [<ip> ...]
+assert_dns_record() {
+    local host=$1
+    local container=$2
+    local name=$3
+    shift 3
+    exp_ips_regex=$(echo "$@" | sed -e 's/ /\\\|/g')
+
+    [ -z "$DEBUG" ] || greyly echo "Checking whether $name exists at $host:$container"
+    assert_raises "exec_on $host $container getent hosts $name | grep -q '$exp_ips_regex'"
+
+    [ -z "$DEBUG" ] || greyly echo "Checking whether the IPs '$@' exists at $host:$container"
+    for ip in "$@" ; do
+        assert "exec_on $host $container getent hosts $ip | tr -s ' ' | tr '[:upper:]' '[:lower:]'" "$(echo $ip $name | tr '[:upper:]' '[:lower:]')"
+    done
+}
+
+# assert_no_dns_record <host> <container> <name>
+assert_no_dns_record() {
+    host=$1
+    container=$2
+    name=$3
+
+    [ -z "$DEBUG" ] || greyly echo "Checking if '$name' does not exist at $host:$container"
+    assert_raises "exec_on $host $container getent hosts $name" 2
+}
+
+# assert_dns_a_record <host> <container> <name> <ip> [<expected_name>]
+assert_dns_a_record() {
+    exp_name=${5:-$3}
+    assert "exec_on $1 $2 getent hosts $3 | tr -s ' ' | cut -d ' ' -f 1,2" "$4 $exp_name"
+}
+
+# assert_dns_ptr_record <host> <container> <name> <ip>
+assert_dns_ptr_record() {
+    assert "exec_on $1 $2 getent hosts $4 | tr -s ' '" "$4 $3"
 }
 
 start_suite() {
-    whitely echo $@
+    for host in $HOSTS; do
+        [ -z "$DEBUG" ] || echo "Cleaning up on $host: removing all containers and resetting weave"
+        PLUGIN_ID=$(docker_on $host ps -aq --filter=name=weaveplugin)
+        PLUGIN_FILTER="cat"
+        [ -n "$PLUGIN_ID" ] && PLUGIN_FILTER="grep -v $PLUGIN_ID"
+        rm_containers $host $(docker_on $host ps -aq 2>/dev/null | $PLUGIN_FILTER)
+        run_on $host "docker network ls | grep -q ' weave ' && docker network rm weave" || true
+        weave_on $host reset 2>/dev/null
+    done
+    whitely echo "$@"
 }
 
 end_suite() {
     whitely assert_end
+    for host in $HOSTS; do
+        stop_router_on $host
+    done
 }
 
-WEAVE=../weave
-DOCKER_NS=./bin/docker-ns
+collect_coverage() {
+    host=$1
+    container=$2
+    mkdir -p ./coverage
+    rm -f cover.prof
+    docker_on $host cp $container:/home/weave/cover.prof . 2>/dev/null || return 0
+    # ideally we'd know the name of the test here, and put that in the filename
+    mv cover.prof $(mktemp -u ./coverage/integration.XXXXXXXX) || true
+}
+
+WEAVE=$DIR/../weave
+DOCKER_NS=$DIR/../bin/docker-ns

@@ -1,9 +1,17 @@
 ---
-title: How Weave works
+title: How Weave Works
 layout: default
 ---
 
-## How does it work?
+# How Weave Works
+
+ * [Overview](#overview)
+ * [Encapsulation](#encapsulation)
+ * [Topology](#topology)
+ * [Crypto](#crypto)
+ * [Further reading](#further-reading)
+
+### <a name="overview"></a>Overview
 
 A weave network consists of a number of 'peers' - weave routers
 residing on different hosts. Each peer has a name, which tends to
@@ -21,8 +29,9 @@ encrypted, which carry encapsulated network packets. These
 
 Weave creates a network bridge on the host. Each container is
 connected to that bridge via a veth pair, the container side of which
-is given the IP address & netmask supplied in 'weave run'. Also
-connected to the bridge is the weave router container.
+is given an IP address & netmask supplied either by the user or
+Weave's IP address allocator. Also connected to the bridge is the
+weave router container.
 
 A weave router captures Ethernet packets from its bridge-connected
 interface in promiscuous mode, using 'pcap'. This typically excludes
@@ -40,6 +49,7 @@ peer. Weave can route packets in partially connected networks with
 changing topology. For example, in this network, peer 1 is connected
 directly to 2 and 3, but if 1 needs to send a packet to 4 or 5 it must
 first send it to peer 3:
+
 ![Partially connected Weave Network](images/top-diag1.png "Partially connected Weave Network")
 
 ### <a name="encapsulation"></a>Encapsulation
@@ -102,30 +112,34 @@ MAC discovery.
 
 The topology information captures which peers are connected to which
 other peers. Weave peers communicate their knowledge of the topology
-(and changes to it) to their neighbours, who then pass this
-information on to their own neighbours, and so on, until the entire
-network knows about any change.
+(and changes to it) to others, so that all peers learn about the
+entire topology. This communication occurs over the TCP links between
+peers, using a) spanning-tree based broadcast mechanism, and b) a
+neighour gossip mechanism.
 
-Topology is communicated over the TCP links between peers, using a
-Gossip mechanism.  Topology messages are sent by a peer...
+Topology messages are sent by a peer...
 
-- when a connection has been added; the entire topology is sent to the
-  remote peer, and an incremental update, containing information on
-  just the two peers at the ends of the connection, is sent to all
-  neighbours,
+- when a connection has been added; if the remote peer appears to be
+  new to the network, the entire topology is sent to it, and an
+  incremental update, containing information on just the two peers at
+  the ends of the connection, is broadcast,
 - when a connection has been marked as 'established', indicating that
   the remote peer can receive UDP traffic from the peer; an update
-  containing just information about the local peer is sent to all
-  neighbours,
+  containing just information about the local peer is broadcast,
 - when a connection has been torn down; an update containing just
-  information about the local peer is sent to all neighbours,
-- periodically, on a timer, in case someone has missed an update.
+  information about the local peer is broadcast,
+- periodically, on a timer, the entire topology is "gossiped" to a
+  subset of neighbours, based on a topology-sensitive random
+  distribution. This is done in case some of the aforementioned
+  broadcasts do not reach all peers, due to rapid changes in the
+  topology causing broadcast routing tables to become outdated.
 
 The receiver of a topology update merges that update with its own
 topology model, adding peers hitherto unknown to it, and updating
 peers for which the update contains a more recent version than known
-to it. If there were any such new/updated peers, then an improved
-update containing them is sent out on all connections.
+to it. If there were any such new/updated peers, and the topology
+update was received over gossip (rather than broadcast), then an
+improved update containing them is gossiped.
 
 If the update mentions a peer that the receiver does not know, then
 the entire update is ignored.
@@ -206,8 +220,8 @@ no longer has any connections within the network, it drops all
 knowledge of that second peer.
 
 #### Out-of-date topology
-The peer-to-peer gossiping of updates is not instantaneous, so it is
-very possible for a node elsewhere in the network to have an
+The propagation of topology changes to all peers is not instantaneous,
+so it is very possible for a node elsewhere in the network to have an
 out-of-date view.
 
 If the destination peer for a packet is still reachable, then
@@ -235,6 +249,16 @@ quite difficult to use NaCl incorrectly. Contrast this with libraries
 such as OpenSSL where the library and its APIs are vast in size,
 poorly documented, and easily used wrongly.
 
+There are some similarities between weave's crypto and
+[TLS](https://tools.ietf.org/html/rfc4346). We do not need to cater
+for multiple cipher suites, certificate exchange and other
+requirements emanating from X509, and a number of other features. This
+simplifies the protocol and implementation considerably. On the other
+hand, we need to support UDP transports, and while there are
+extensions to TLS such as [DTLS](https://tools.ietf.org/html/rfc4347)
+which can operate over UDP, these are not widely implemented and
+deployed.
+
 #### Establishing the Ephemeral Session Key
 
 For every connection between peers, a fresh public/private key pair is
@@ -252,41 +276,76 @@ local peer in the usual Diffie-Hellman way, resulting in both peers
 arriving at the same shared key. To this is appended the supplied
 password, and the result is hashed through SHA256, to form the final
 ephemeral session key. Thus the supplied password is never exchanged
-directly, and is thoroughly mixed into the shared secret. The shared
-key formed by Diffie-Hellman is 256 bits long, appending the password
-to this obviously makes it longer by an unknown amount, and the use of
-SHA256 reduces this back to 256 bits, to form the final ephemeral
-session key. This late combination with the password eliminates "Man
-In The Middle" attacks: sniffing the public key exchange between the
-two peers and faking their responses will not grant an attacker
-knowledge of the password, and so an attacker would not be able to
-form valid ephemeral session keys.
+directly, and is thoroughly mixed into the shared secret. Furthermore,
+the rate at which TCP connections are accepted is limited by weave to
+10Hz, which twarts online dictionary attacks on reasonably strong
+passwords.
+
+The shared key formed by Diffie-Hellman is 256 bits long, appending
+the password to this obviously makes it longer by an unknown amount,
+and the use of SHA256 reduces this back to 256 bits, to form the final
+ephemeral session key. This late combination with the password
+eliminates "Man In The Middle" attacks: sniffing the public key
+exchange between the two peers and faking their responses will not
+grant an attacker knowledge of the password, and so an attacker would
+not be able to form valid ephemeral session keys.
 
 The same ephemeral session key is used for both TCP and UDP traffic
 between two peers.
 
+<a name="csprng"></a> Generating fresh keys for every connection
+provides forward secrecy at the cost of placing a demand on the Linux
+CSPRNG (accessed by `GenerateKey` via `/dev/urandom`) proportional to
+the number of inbound connection attempts. Weave has accept throttling
+to mitigate against denial of service attacks that seek to deplete the
+CSPRNG entropy pool, however even at the lower bound of ten requests
+per second there may not be enough entropy gathered on a headless
+system to keep pace.
+
+Under such conditions, the consequences will be limited to slowing
+down processes reading from the blocking `/dev/random` device as the
+kernel waits for enough new entropy to be harvested. It is important
+to note that contrary to intuition this low entropy state does not
+compromise the ongoing use of `/dev/urandom` - [expert
+opinion](http://blog.cr.yp.to/20140205-entropy.html)
+asserts that as long as the CSPRNG is seeded with enough entropy (e.g.
+256 bits) before random number generation commences then the output is
+entirely safe for use as key material.
+
+By way of comparison, this is exactly how OpenSSL works - it reads 256
+bits of entropy at startup, and uses that to seed an internal CSPRNG
+which is used thenceforth to generate keys. Whilst we could have taken
+the same approach and built our own CSPRNG to work around the
+potential `/dev/random` blocking issue, we thought it was much more
+prudent to rely on the [heavily
+scrutinised](http://eprint.iacr.org/2012/251.pdf) Linux random number
+generator as [advised
+here](http://cr.yp.to/highspeed/coolnacl-20120725.pdf) (page 10,
+'Centralizing randomness'). The aforementioned notwithstanding, if
+weave's demand on `/dev/urandom` is causing you problems with blocking
+`/dev/random` reads, please get in touch with us - we'd love to hear
+about your use case.
+
 #### TCP
 
 TCP connection are only used to exchange topology information between
-peers, via a message-based protocol. The router generates a fresh
-192-bit random nonce for every message to be sent, and prepends the
-nonce to the encrypted message, as is normal in NaCl, so that the
-receiver knows the nonce. Encryption of each message is carried out
-using NaCl's `secretbox.Seal` function using the ephemeral session
-key. Each TCP connection has a monotonically incrementing message
-counter, the current value of which is included in the encrypted part
-of the message. Given the assumption that TCP is reliable and ordered,
-a message received via TCP is only acted upon if the message counter
-in the received message is the expected message counter. This prevents
-replay attacks on the TCP connection.
+peers, via a message-based protocol. Encryption of each message is
+carried out by NaCl's `secretbox.Seal` function using the ephemeral
+session key and a nonce. The nonce contains the message sequence
+number, which is incremented for every message sent, and a bit
+indicating the polarity of the connection at the sender ('1' for
+outbound). The latter is required by the
+[NaCl Security Model](http://nacl.cr.yp.to/box.html) in order to
+ensure that the two ends of the connection do not use the same nonces.
 
-As TCP connections do not carry captured traffic, minimising message
-size or latency is not a major concern, so the potentially substantial
-increase in length of messages by prepending the full nonce, or the
-cost of generating a fresh random nonce for each message is not
-considered likely to cause problems. The random nonces are created by
-the go `crypto/rand` package, which implements a cryptographically
-secure pseudorandom number generator.
+Decryption of a message at the receiver is carried out by NaCl's
+`secretbox.Open` function using the ephemeral session key and a
+nonce. The receiver maintains its own message sequence number, which
+it increments for every message it decrypted successfully. The nonce
+is constructed from that sequence number and the connection
+polarity. As a result the receiver will only be able to decrypt a
+message if it has the expected sequence number. This prevents replay
+attacks.
 
 #### UDP
 
@@ -297,7 +356,7 @@ follows:
     +-----------------------------------+
     | Name of sending peer              |
     +-----------------------------------+
-    | Nonce offset and flags            |
+    | Message Sequence No and flags     |
     +-----------------------------------+
     | NaCl SecretBox overheads          |
     +-----------------------------------+ -+
@@ -330,71 +389,38 @@ follows:
 
 This is very similar to the [non-crypto encapsulation](#encapsulation).
 
-All of the frames are encrypted with the same ephemeral session key
-and all must be decrypted by the receiving peer. Frames which are to
-be forwarded on to some further peer will be re-encrypted with the
-relevant ephemeral session keys for the onward connections. Thus all
-traffic is fully decrypted on every peer it passes through.
-Encryption is again done with the NaCl `secretbox.Seal` function.
+All of the frames on a connection are encrypted with the same
+ephemeral session key, and a nonce constructed from a message sequence
+number, flags and the connection polarity. This is very similar to the
+TCP encryption scheme, and encryption is again done with the NaCl
+`secretbox.Seal` function. The main difference is that the message
+sequence number and flags are transmitted as part of the message,
+unencrypted.
 
-The name of the sending peer enables the receiver to identify the peer
-who sent this UDP packet, and in turn to determine which ephemeral
-session key was used and which nonce, and perform decryption. To avoid
-sending a fresh 192-bit nonce with every UDP packet, which would pose
-an unacceptable overhead, each UDP packet only carries the lowest 15
-bits of the nonce, which is treated as an offset from the "established
-nonce". The lifecycle of a nonce for UDP is:
+The receiver uses the name of the sending peer to determine which
+ephemeral session key and local cryptographic state to use for
+decryption. Frames which are to be forwarded on to some further peer
+will be re-encrypted with the relevant ephemeral session keys for the
+onward connections. Thus all traffic is fully decrypted on every peer
+it passes through.
 
-1. A fresh nonce is generated and the most significant 177 bits are
-sent to the receiving peer over the TCP connection. These upper most
-177 bits are used for the next 2^15 (32768) UDP messages. This is the
-"established nonce".
+Decryption is once again carried out by NaCl's `secretbox.Open`
+function using the ephemeral session key and nonce. The latter is
+constructed from the message sequence number and flags that appeared
+in the unencrypted portion of the received message, and the connection
+polarity.
 
-2. Each UDP message carries the lowest 15 bits as a unique counter. Thus
-the lowest 15 bits are combined with (appended to) the uppermost 177
-bits to form the unique nonce for that message.
+To guard against replay attacks, the receiver maintains some state in
+which it remembers the highest message sequence number seen. It could
+simply reject messages with lower sequence numbers, but that could
+result in excessive message loss when messages are re-ordered. The
+receiver therefore additionally maintains a set of received message
+sequence numbers in a window below the highest number seen, and only
+rejects messages with a sequence number below that window, or
+contained in the set. The window spans at least 2^20 message sequence
+numbers, and hence any re-ordering between the most recent ~1 million
+messages is handled without dropping messages.
 
-3. Once the sending side has sent the 16384'th message on the current
-nonce (50% of the way through the available range), it generates a new
-nonce (upper 177 bits only) and sends that over the TCP connection,
-thus hopefully ensuring it arrives and is ready before it is
-needed. The sending side will switch to using the new nonce once the
-full 32768 messages of the current nonce have been used. At this
-point, the sending side resets the offset to 0.
-
-4. The receiving side must deal with the fact that UDP is unreliable
-and unordered. The receiving side keeps track of the highest offset
-seen for each established nonce. The condition to switching to the new
-nonce it has received via the TCP connection is: the highest offset
-seen for the current nonce must be above 24576 (75% of the available
-range) _and_ the current message just received must have an offset
-less than 8192 (25% of the available range) _and_ the new offset must
-be less than 8192 messages *ahead* of the highest seen offset so far
-(assuming modulo 32768). If these conditions are met, the highest
-offset is set to the offset of the current message and the new nonce
-is used. If those conditions are not met, the receiving side continues
-with the current nonce (according to the rules below), updating the
-highest offset seen as appropriate. Thus in order for the nonce to not
-be updated correctly would require a loss of at least 8192 messages.
-
-5. When the receiving side switches to the new nonce, it does not
-discard the old nonce. If the highest offset seen is below 8192 (25% of
-the range) _and_ the current message offset is above 24576 (75% of the
-range), _and_ the current message offset is less than 8192 behind the
-highest seen nonce (assuming modulo 32768), then the current message is
-decoded with the old nonce.
-
-6. In the remaining cases, the current message is only decoded if its
-offset is within 8192 either side of the highest seen offset.
-
-7. To avoid replay attacks, the receiving side keeps a set of which
-offsets have been used with the current and previous nonce. If the
-offset doesn't exist in the set, and the message can be correctly
-decoded, the offset is added to the relevant set (thus we avoid
-poisoning attacks). If the offset already exists in the set, or the
-message cannot be correctly decoded, the message is not processed
-further.
-
-### Further reading
+### <a name="further-reading"></a>Further reading
 More details on the inner workings of weave can be found in the
-[architecture documentation](https://github.com/zettio/weave/blob/master/docs/architecture.txt).
+[architecture documentation](https://github.com/weaveworks/weave/blob/master/docs/architecture.txt).

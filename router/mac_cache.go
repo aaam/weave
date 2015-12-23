@@ -1,16 +1,16 @@
 package router
 
 import (
-	"bytes"
-	"fmt"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/weaveworks/weave/mesh"
 )
 
 type MacCacheEntry struct {
 	lastSeen time.Time
-	peer     *Peer
+	peer     *mesh.Peer
 }
 
 type MacCache struct {
@@ -18,60 +18,74 @@ type MacCache struct {
 	table       map[uint64]*MacCacheEntry
 	maxAge      time.Duration
 	expiryTimer *time.Timer
-	onExpiry    func(net.HardwareAddr, *Peer)
+	onExpiry    func(net.HardwareAddr, *mesh.Peer)
 }
 
-func NewMacCache(maxAge time.Duration, onExpiry func(net.HardwareAddr, *Peer)) *MacCache {
-	return &MacCache{
+func NewMacCache(maxAge time.Duration, onExpiry func(net.HardwareAddr, *mesh.Peer)) *MacCache {
+	cache := &MacCache{
 		table:    make(map[uint64]*MacCacheEntry),
 		maxAge:   maxAge,
 		onExpiry: onExpiry}
-}
-
-func (cache *MacCache) Start() {
 	cache.setExpiryTimer()
+	return cache
 }
 
-func (cache *MacCache) Enter(mac net.HardwareAddr, peer *Peer) bool {
+func (cache *MacCache) add(mac net.HardwareAddr, peer *mesh.Peer, force bool) (bool, *mesh.Peer) {
 	key := macint(mac)
 	now := time.Now()
+
 	cache.RLock()
 	entry, found := cache.table[key]
 	if found && entry.peer == peer && now.Before(entry.lastSeen.Add(cache.maxAge/10)) {
 		cache.RUnlock()
-		return false
+		return false, nil
 	}
 	cache.RUnlock()
+
 	cache.Lock()
 	defer cache.Unlock()
+
 	entry, found = cache.table[key]
 	if !found {
 		cache.table[key] = &MacCacheEntry{lastSeen: now, peer: peer}
-		return true
+		return true, nil
 	}
+
 	if entry.peer != peer {
-		entry.lastSeen = now
+		if !force {
+			return false, entry.peer
+		}
+
 		entry.peer = peer
-		return true
 	}
+
 	if now.After(entry.lastSeen.Add(cache.maxAge / 10)) {
 		entry.lastSeen = now
 	}
-	return false
+
+	return false, nil
 }
 
-func (cache *MacCache) Lookup(mac net.HardwareAddr) (*Peer, bool) {
+func (cache *MacCache) Add(mac net.HardwareAddr, peer *mesh.Peer) (bool, *mesh.Peer) {
+	return cache.add(mac, peer, false)
+}
+
+func (cache *MacCache) AddForced(mac net.HardwareAddr, peer *mesh.Peer) (bool, *mesh.Peer) {
+	return cache.add(mac, peer, true)
+}
+
+func (cache *MacCache) Lookup(mac net.HardwareAddr) *mesh.Peer {
 	key := macint(mac)
 	cache.RLock()
 	defer cache.RUnlock()
 	entry, found := cache.table[key]
 	if !found {
-		return nil, false
+		return nil
 	}
-	return entry.peer, true
+	return entry.peer
 }
 
-func (cache *MacCache) Delete(peer *Peer) bool {
+func (cache *MacCache) Delete(peer *mesh.Peer) bool {
 	found := false
 	cache.Lock()
 	defer cache.Unlock()
@@ -82,16 +96,6 @@ func (cache *MacCache) Delete(peer *Peer) bool {
 		}
 	}
 	return found
-}
-
-func (cache *MacCache) String() string {
-	var buf bytes.Buffer
-	cache.RLock()
-	defer cache.RUnlock()
-	for key, entry := range cache.table {
-		fmt.Fprintf(&buf, "%v -> %s (%v)\n", intmac(key), entry.peer.FullName(), entry.lastSeen)
-	}
-	return buf.String()
 }
 
 func (cache *MacCache) setExpiryTimer() {
@@ -109,4 +113,21 @@ func (cache *MacCache) expire() {
 		}
 	}
 	cache.setExpiryTimer()
+}
+
+func macint(mac net.HardwareAddr) (r uint64) {
+	for _, b := range mac {
+		r <<= 8
+		r |= uint64(b)
+	}
+	return
+}
+
+func intmac(key uint64) (r net.HardwareAddr) {
+	r = make([]byte, 6)
+	for i := 5; i >= 0; i-- {
+		r[i] = byte(key)
+		key >>= 8
+	}
+	return
 }

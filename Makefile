@@ -1,89 +1,167 @@
-PUBLISH=publish_weave publish_weavedns publish_weaveexec
+PUBLISH=publish_weave publish_weaveexec
 
 .DEFAULT: all
-.PHONY: all update tests publish $(PUBLISH) clean prerequisites build travis
+.PHONY: all update tests lint publish $(PUBLISH) clean clean-bin prerequisites build travis run-smoketests
 
 # If you can use docker without being root, you can do "make SUDO="
 SUDO=sudo
 
-DOCKERHUB_USER=zettio
+DOCKERHUB_USER=weaveworks
 WEAVE_VERSION=git-$(shell git rev-parse --short=12 HEAD)
-WEAVER_EXE=weaver/weaver
-WEAVEDNS_EXE=weavedns/weavedns
+
+WEAVER_EXE=prog/weaver/weaver
+WEAVEPROXY_EXE=prog/weaveproxy/weaveproxy
+SIGPROXY_EXE=prog/sigproxy/sigproxy
+WEAVEWAIT_EXE=prog/weavewait/weavewait
+WEAVEWAIT_NOOP_EXE=prog/weavewait/weavewait_noop
+WEAVEWAIT_NOMCAST_EXE=prog/weavewait/weavewait_nomcast
+NETCHECK_EXE=prog/netcheck/netcheck
+DOCKERTLSARGS_EXE=prog/docker_tls_args/docker_tls_args
+DOCKERPLUGIN_EXE=prog/plugin/plugin
+RUNNER_EXE=tools/runner/runner
+TEST_TLS_EXE=test/tls/tls
+
+EXES=$(WEAVER_EXE) $(SIGPROXY_EXE) $(WEAVEPROXY_EXE) $(WEAVEWAIT_EXE) $(WEAVEWAIT_NOOP_EXE) $(WEAVEWAIT_NOMCAST_EXE) $(NETCHECK_EXE) $(DOCKERTLSARGS_EXE) $(DOCKERPLUGIN_EXE) $(TEST_TLS_EXE)
+
+WEAVER_UPTODATE=.weaver.uptodate
+WEAVEEXEC_UPTODATE=.weaveexec.uptodate
+DOCKERPLUGIN_UPTODATE=.dockerplugin.uptodate
+
+IMAGES_UPTODATE=$(WEAVER_UPTODATE) $(WEAVEEXEC_UPTODATE) $(DOCKERPLUGIN_UPTODATE)
+
 WEAVER_IMAGE=$(DOCKERHUB_USER)/weave
-WEAVEDNS_IMAGE=$(DOCKERHUB_USER)/weavedns
 WEAVEEXEC_IMAGE=$(DOCKERHUB_USER)/weaveexec
-WEAVER_EXPORT=weave.tar
-WEAVEDNS_EXPORT=weavedns.tar
-WEAVEEXEC_EXPORT=weaveexec.tar
+DOCKERPLUGIN_IMAGE=$(DOCKERHUB_USER)/plugin
 
-WEAVEEXEC_DOCKER_VERSION=1.3.1
-DOCKER_DISTRIB=weaveexec/docker-$(WEAVEEXEC_DOCKER_VERSION).tgz
+IMAGES=$(WEAVER_IMAGE) $(WEAVEEXEC_IMAGE) $(DOCKERPLUGIN_IMAGE)
+
+WEAVE_EXPORT=weave.tar.gz
+
+WEAVEEXEC_DOCKER_VERSION=1.6.2
+DOCKER_DISTRIB=prog/weaveexec/docker-$(WEAVEEXEC_DOCKER_VERSION).tgz
 DOCKER_DISTRIB_URL=https://get.docker.com/builds/Linux/x86_64/docker-$(WEAVEEXEC_DOCKER_VERSION).tgz
+NETGO_CHECK=@strings $@ | grep cgo_stub\\\.go >/dev/null || { \
+	rm $@; \
+	echo "\nYour go standard library was built without the 'netgo' build tag."; \
+	echo "To fix that, run"; \
+	echo "    sudo go clean -i net"; \
+	echo "    sudo go install -tags netgo std"; \
+	false; \
+}
+BUILD_FLAGS=-ldflags "-extldflags \"-static\" -X main.version $(WEAVE_VERSION)" -tags netgo
 
-all: $(WEAVER_EXPORT) $(WEAVEDNS_EXPORT) $(WEAVEEXEC_EXPORT)
+PACKAGE_BASE=$(shell go list -e ./)
 
-travis: $(WEAVER_EXE) $(WEAVEDNS_EXE)
+all: $(WEAVE_EXPORT) $(RUNNER_EXE) $(TEST_TLS_EXE)
+
+travis: $(EXES)
 
 update:
-	go get -u -f -v -tags -netgo ./$(dir $(WEAVER_EXE)) ./$(dir $(WEAVEDNS_EXE))
+	go get -u -f -v -tags netgo $(addprefix ./,$(dir $(EXES)))
 
-$(WEAVER_EXE) $(WEAVEDNS_EXE): common/*.go
+$(WEAVER_EXE) $(WEAVEPROXY_EXE): common/*.go common/*/*.go net/*.go
+ifeq ($(COVERAGE),true)
+	$(eval COVERAGE_MODULES := $(shell (go list ./$(@D); go list -f '{{join .Deps "\n"}}' ./$(@D) | grep "^$(PACKAGE_BASE)/") | paste -s -d,))
+	go get -t -tags netgo ./$(@D)
+	go test -c -o ./$@ $(BUILD_FLAGS) -v -covermode=atomic -coverpkg $(COVERAGE_MODULES) ./$(@D)/
+else
 	go get -tags netgo ./$(@D)
-	go build -ldflags "-extldflags \"-static\" -X main.version $(WEAVE_VERSION)" -tags netgo -o $@ ./$(shell dirname $@)
-	@strings $@ | grep cgo_stub\\\.go >/dev/null || { \
-		rm $@; \
-		echo "\nYour go standard library was built without the 'netgo' build tag."; \
-		echo "To fix that, run"; \
-		echo "    sudo go clean -i net"; \
-		echo "    sudo go install -tags netgo std"; \
-		false; \
-	}
+	go build $(BUILD_FLAGS) -o $@ ./$(@D)
+endif
+	$(NETGO_CHECK)
 
-$(WEAVER_EXE): router/*.go weaver/main.go
-$(WEAVEDNS_EXE): nameserver/*.go weavedns/main.go
+$(NETCHECK_EXE): common/*.go common/*/*.go net/*.go
+	go get -tags netgo ./$(@D)
+	go build $(BUILD_FLAGS) -o $@ ./$(@D)
+	$(NETGO_CHECK)
 
-$(WEAVER_EXPORT): weaver/Dockerfile $(WEAVER_EXE)
-	$(SUDO) docker build -t $(WEAVER_IMAGE) weaver
-	$(SUDO) docker save $(WEAVER_IMAGE):latest > $@
+$(WEAVER_EXE): router/*.go mesh/*.go ipam/*.go ipam/*/*.go nameserver/*.go prog/weaver/*.go
+$(WEAVEPROXY_EXE): proxy/*.go prog/weaveproxy/main.go
+$(NETCHECK_EXE): prog/netcheck/netcheck.go
 
-$(WEAVEDNS_EXPORT): weavedns/Dockerfile $(WEAVEDNS_EXE)
-	$(SUDO) docker build -t $(WEAVEDNS_IMAGE) weavedns
-	$(SUDO) docker save $(WEAVEDNS_IMAGE):latest > $@
+# These next programs need separate rules as they fail the netgo check in
+# the main build stanza due to not importing net package
+$(SIGPROXY_EXE): prog/sigproxy/main.go
+$(DOCKERTLSARGS_EXE): prog/docker_tls_args/*.go
+$(DOCKERPLUGIN_EXE): prog/plugin/*.go plugin/net/*.go plugin/ipam/*.go plugin/skel/*.go api/*.go common/docker/*.go
+$(TEST_TLS_EXE): test/tls/*.go
 
-$(WEAVEEXEC_EXPORT): weaveexec/Dockerfile $(DOCKER_DISTRIB) weave
-	cp weave weaveexec/weave
-	cp $(DOCKER_DISTRIB) weaveexec/docker.tgz
-	$(SUDO) docker build -t $(WEAVEEXEC_IMAGE) weaveexec
-	$(SUDO) docker save $(WEAVEEXEC_IMAGE):latest > $@
+$(SIGPROXY_EXE) $(DOCKERTLSARGS_EXE) $(DOCKERPLUGIN_EXE) $(TEST_TLS_EXE):
+	go get -tags netgo ./$(@D)
+	go build $(BUILD_FLAGS) -o $@ ./$(@D)
+
+$(WEAVEWAIT_EXE): prog/weavewait/*.go net/*.go
+	go get -tags netgo ./$(@D)
+	go build $(BUILD_FLAGS) -tags "netgo iface mcast" -o $@ ./$(@D)
+
+$(WEAVEWAIT_NOMCAST_EXE): prog/weavewait/*.go net/*.go
+	go get -tags netgo ./$(@D)
+	go build $(BUILD_FLAGS) -tags "netgo iface" -o $@ ./$(@D)
+
+$(WEAVEWAIT_NOOP_EXE): prog/weavewait/*.go
+	go get -tags netgo ./$(@D)
+	go build $(BUILD_FLAGS) -o $@ ./$(@D)
+
+$(WEAVER_UPTODATE): prog/weaver/Dockerfile $(WEAVER_EXE)
+	$(SUDO) DOCKER_HOST=$(DOCKER_HOST) docker build -t $(WEAVER_IMAGE) prog/weaver
+	touch $@
+
+$(WEAVEEXEC_UPTODATE): prog/weaveexec/Dockerfile prog/weaveexec/symlink $(DOCKER_DISTRIB) weave $(SIGPROXY_EXE) $(WEAVEPROXY_EXE) $(WEAVEWAIT_EXE) $(WEAVEWAIT_NOOP_EXE) $(WEAVEWAIT_NOMCAST_EXE) $(NETCHECK_EXE) $(DOCKERTLSARGS_EXE)
+	cp weave prog/weaveexec/weave
+	cp $(SIGPROXY_EXE) prog/weaveexec/sigproxy
+	cp $(WEAVEPROXY_EXE) prog/weaveexec/weaveproxy
+	cp $(WEAVEWAIT_EXE) prog/weaveexec/weavewait
+	cp $(WEAVEWAIT_NOOP_EXE) prog/weaveexec/weavewait_noop
+	cp $(WEAVEWAIT_NOMCAST_EXE) prog/weaveexec/weavewait_nomcast
+	cp $(NETCHECK_EXE) prog/weaveexec/netcheck
+	cp $(DOCKERTLSARGS_EXE) prog/weaveexec/docker_tls_args
+	cp $(DOCKER_DISTRIB) prog/weaveexec/docker.tgz
+	$(SUDO) DOCKER_HOST=$(DOCKER_HOST) docker build -t $(WEAVEEXEC_IMAGE) prog/weaveexec
+	touch $@
+
+$(DOCKERPLUGIN_UPTODATE): prog/plugin/Dockerfile $(DOCKERPLUGIN_EXE)
+	$(SUDO) docker build -t $(DOCKERPLUGIN_IMAGE) prog/plugin
+	touch $@
+
+$(WEAVE_EXPORT): $(IMAGES_UPTODATE)
+	$(SUDO) DOCKER_HOST=$(DOCKER_HOST) docker save $(addsuffix :latest,$(IMAGES)) | gzip > $@
 
 $(DOCKER_DISTRIB):
 	curl -o $(DOCKER_DISTRIB) $(DOCKER_DISTRIB_URL)
 
-tests:
-	echo "mode: count" > profile.cov
-	for dir in $$(find . -type f -name '*_test.go' | xargs -n1 dirname | sort -u); do     \
-	    output=$$(tempfile -p cover);                                                     \
-	    go test -tags netgo -covermode=count -coverprofile=$$output $$dir;                \
-	    if [ -f $$output ]; then                                                          \
-	        tail -n +2 <$$output >>profile.cov;                                           \
-	        rm $$output;                                                                  \
-	    fi                                                                                \
-	done
-	go tool cover -html=profile.cov -o=coverage.html
+tests: tools/.git
+	tools/test
 
-$(PUBLISH): publish_%:
-	$(SUDO) docker tag -f $(DOCKERHUB_USER)/$* $(DOCKERHUB_USER)/$*:$(WEAVE_VERSION)
-	$(SUDO) docker push   $(DOCKERHUB_USER)/$*:$(WEAVE_VERSION)
-	$(SUDO) docker push   $(DOCKERHUB_USER)/$*:latest
+lint: tools/.git
+	tools/lint -nocomment -notestpackage .
+
+tools/.git:
+	git submodule update --init
+
+$(RUNNER_EXE): tools/.git
+	make -C tools/runner
+
+$(PUBLISH): publish_%: $(IMAGES_UPTODATE)
+	$(SUDO) DOCKER_HOST=$(DOCKER_HOST) docker tag -f $(DOCKERHUB_USER)/$* $(DOCKERHUB_USER)/$*:$(WEAVE_VERSION)
+	$(SUDO) DOCKER_HOST=$(DOCKER_HOST) docker push   $(DOCKERHUB_USER)/$*:$(WEAVE_VERSION)
+ifneq ($(UPDATE_LATEST),false)
+	$(SUDO) DOCKER_HOST=$(DOCKER_HOST) docker push   $(DOCKERHUB_USER)/$*:latest
+endif
 
 publish: $(PUBLISH)
 
-clean:
-	-$(SUDO) docker rmi $(WEAVER_IMAGE) $(WEAVEDNS_IMAGE) $(WEAVEEXEC_IMAGE)
-	rm -f $(WEAVER_EXE) $(WEAVEDNS_EXE) $(WEAVER_EXPORT) $(WEAVEDNS_EXPORT) $(WEAVEEXEC_EXPORT)
+clean-bin:
+	-$(SUDO) DOCKER_HOST=$(DOCKER_HOST) docker rmi $(IMAGES)
+	go clean -r $(addprefix ./,$(dir $(EXES)))
+	rm -f $(EXES) $(IMAGES_UPTODATE) $(WEAVE_EXPORT)
+
+clean: clean-bin
+	rm -rf test/tls/*.pem test/coverage.* test/coverage
 
 build:
 	$(SUDO) go clean -i net
 	$(SUDO) go install -tags netgo std
 	$(MAKE)
+
+run-smoketests: all
+	cd test && ./setup.sh && ./run_all.sh

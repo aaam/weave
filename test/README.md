@@ -2,16 +2,24 @@ This directory contains integration tests for weave.
 
 ## Requirements
 
-You need two VMs with docker >=1.3.1 installed and listening on TCP
+You need two VMs with docker >=1.6.0 installed and listening on TCP
 port 2375 (see below). You also need to be able to ssh to these VMs,
 preferably without having to input anything.
 
-The `Vagrantfile` in this directory constructs two such VMs. To meet
-the aforementioned ssh requirement you may want to
+The `Vagrantfile` in this directory constructs two such VMs.
+
+To create the VMs, open a shell and in this directory and type
+
+    vagrant up
+
+To meet the aforementioned ssh requirement you may want to
 
     cp ~/.vagrant.d/insecure_private_key .
 
 ## Running tests
+
+If you are [building weave using Vagrant](http://docs.weave.works/weave/latest_release/building.html),
+it is recommended to run the tests from the build VM and not the host.
 
     ./setup.sh
 
@@ -49,3 +57,23 @@ DOCKER_OPTS="--host unix:///var/run/docker.sock --host tcp://0.0.0.0:2375"
 ```
 
 to the file `/etc/default/docker`, then restart docker.
+
+## Updating the GCE test image
+
+When a new version of Docker is released, you'll need to update the GCE test image.
+
+To do this, pick a fresh ```TEMPLATE_NAME``` and update any commands in
+```function make_template``` in gce.sh, then run:
+
+```
+./gce.sh make_template
+```
+
+For this you'll need the GCE credentials, which can be found in ```bin/setup-circleci-secrets```,
+which you'll need to decrypt and run (its echos the secrets into know locations):
+
+```
+./bin/setup-circleci-secrets "$SECRET_PASSWORD"
+```
+
+If you don't know the password, ask tom@weave.works.

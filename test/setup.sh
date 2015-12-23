@@ -2,21 +2,31 @@
 
 set -e
 
-if ! [ -f "./assert.sh" ]; then
-    echo Fetching assert script
-    curl -sS https://raw.githubusercontent.com/lehmannro/assert.sh/master/assert.sh > ./assert.sh
-fi
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 . ./config.sh
 
-echo Copying weave images and script to hosts
-for HOST in $HOSTS; do
-    docker_on $HOST load -i ../weave.tar
-    docker_on $HOST load -i ../weavedns.tar
-    docker_on $HOST load -i ../weaveexec.tar
+(cd ./tls && ./tls $HOSTS)
+
+echo "Copying weave images, scripts, and certificates to hosts, and"
+echo "  prefetch test images"
+
+setup_host() {
+    HOST=$1
+    docker_on $HOST load -i ../weave.tar.gz
+    DANGLING_IMAGES="$(docker_on $HOST images -q -f dangling=true)"
+    [ -n "$DANGLING_IMAGES" ] && docker_on $HOST rmi $DANGLING_IMAGES 1>/dev/null 2>&1 || true
     run_on $HOST mkdir -p bin
-    cat ../bin/docker-ns | run_on $HOST sh -c "cat > $DOCKER_NS"
-    cat ../weave | run_on $HOST sh -c "cat > ./weave"
-    run_on $HOST chmod a+x $DOCKER_NS ./weave
-    run_on $HOST sudo service docker restart
+    upload_executable $HOST ../bin/docker-ns
+    upload_executable $HOST ../weave
+    rsync -az -e "$SSH" --exclude=tls ./tls/ $HOST:~/tls
+    for IMG in $TEST_IMAGES ; do
+        docker_on $HOST inspect --format=" " $IMG >/dev/null 2>&1 || docker_on $HOST pull $IMG
+    done
+}
+
+for HOST in $HOSTS; do
+    setup_host $HOST &
 done
+
+wait
